@@ -1,6 +1,6 @@
 # Coding Hotkeys
 
-AutoHotkey and X11 scripts to increase programming productivity on Windows. Made for Finnish keyboard layout and mostly tested with Notepad++ on Windows and Kate on X11, but should be easily modified for other layouts and text editors. See the scripts for details. 
+AutoHotkey and X11 scripts to increase programming productivity on non-Vi text editors. Made for Finnish keyboard layout and mostly tested with Notepad++ on Windows and Kate on X11, but should be easily modified for other layouts and text editors. See the scripts for details. 
 
 ### winvi.ahk
 

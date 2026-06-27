@@ -1,5 +1,6 @@
-#define XK_MISCELLANY
 #define XK_LATIN1
+#define XK_MISCELLANY
+#define XK_XKB_KEYS // XKB extension for AltGr
 #include <X11/Xlib.h>
 #include <X11/keysymdef.h>
 
@@ -35,9 +36,22 @@ const char* g_text_editors[] =
     "Typora",
 };
 
+// Analyzing multiple lines at once on multi-line operations is faster, but may
+// introduce annoying scrolling.
+#define LINES_TO_ANALYZE 5
+
 Display* g_display;
 Window   g_root;
 Atom     WM_CLASS;
+
+static const KeySym MODIFIERS[] =
+{
+    XK_Meta_L, XK_Meta_R,
+    XK_Alt_L, XK_Alt_R,
+    XK_Super_L, XK_Super_R,
+    XK_Hyper_L, XK_Hyper_R,
+    XK_ISO_Level3_Shift, // AltGr
+};
 
 #define fail(...) exit(!!fprintf(stderr, "hotkeys: "__VA_ARGS__))
 
@@ -62,6 +76,22 @@ void x_ptr_free(void* ptrptr)
     XFree(*(void**)ptrptr);
 }
 #define XFREE __attribute__((cleanup(x_ptr_free)))
+
+Data data_clone(Data data)
+{
+    Data new_data = {
+        .length   = data.length,
+        .capacity = data.length + sizeof"",
+        .data     = xmalloc(data.length + sizeof""),
+    };
+    memcpy(new_data.data, data.data, data.length + sizeof"");
+    return new_data;
+}
+
+bool data_equal(Data a, Data b)
+{
+    return a.length == b.length && memcmp(a.data, b.data, a.length) == 0;
+}
 
 void data_free(Data* data)
 {
@@ -164,7 +194,7 @@ Data peek_selection(Window window, Data* optional_buf)
 
     send_key(window, XK_c, ControlMask);
     XFlush(g_display);
-    usleep(10); // wait for copy to happen
+    usleep(1000); // wait for copy to happen
 
     Data clipboard = get_clipboard(optional_buf);
     set_clipboard(clipboard_backup);
@@ -176,6 +206,73 @@ bool key_down(char keymap[32], KeySym key)
 {
     KeyCode keycode = XKeysymToKeycode(g_display, key);
     return keymap[keycode >> 3] & (1 << (keycode&7));
+}
+
+// UTF-8 codepoint size. We should handle graphemes instead, but this is simpler
+// and I'm feeling lazy.
+size_t char_size(const char* _ptr)
+{
+    const unsigned char* ptr = (unsigned char*)_ptr;
+    static const unsigned sizes[] = {
+        1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+        0,0,0,0,0,0,0,0, 2,2,2,2,3,3,4,0 };
+    return sizes[*ptr >> 3];
+}
+
+// UTF-8 codepoint size of the leftmost character.
+size_t char_size_back(const char* ptr)
+{
+    const char* p1 = ptr - 1;
+    while (char_size(p1) == 0)
+        p1--;
+    return ptr - p1;
+}
+
+char* find_above(Window window, Data* selection, const char* utf8_character)
+{
+    if (strlen(utf8_character) < 1 || 4 < strlen(utf8_character))
+        fail("Assumed single codepoint characters.\n");
+
+    // Modifiers will cause mayhem when selecting and peeking clipboard.
+    for (bool modifier_down = true; modifier_down; usleep(1000)) {
+        char keymap[32];
+        XQueryKeymap(g_display, keymap);
+        for (size_t i = 0; i < sizeof MODIFIERS / sizeof MODIFIERS[0]; ++i)
+            modifier_down |= key_down(keymap, MODIFIERS[i]);
+    }
+
+    // TODO we should be able to abort search too.
+
+    // We'll just plow trough the whole clipboard IF it doesn't get too slow.
+    // Have to test with large(ihs) files input.
+
+    size_t line = 0; // offset from cursor position
+    char* position = NULL;
+
+    // We'll just plow trough the whole clipboard every time. This has some
+    // repeated work, but the string search will be fast anyway (think about
+    // grep) compared to sending events and waiting for clipboard. This is a
+    // major simplification, because analyzing the string in parts can slice
+    // UTF-8 codepoints, which is a huge pain to deal with.
+
+    while (position == NULL) {
+        DATA_FREE Data old_selection = data_clone(*selection);
+        for (size_t i = 0; i < LINES_TO_ANALYZE; i++)
+            send_key(window, XK_Up, ShiftMask);
+
+        peek_selection(window, selection);
+        if (data_equal(*selection, old_selection)) // end of file
+            return NULL;
+
+        position = strstr(selection->data, utf8_character);
+    }
+    return position;
+}
+
+char* find_below(Window window, Data* selection, const char* utf8_character)
+{
+    // TODO TEMP
+    return find_above(window, selection, utf8_character);
 }
 
 int main(void)
@@ -215,165 +312,209 @@ int main(void)
             g_root, False, GrabModeAsync, GrabModeSync);
     }
 
+    // Negatives go back, positives go forward, which is nicer for logic than
+    // using KeySym constants.
     enum {
+        UP    = -2,
         LEFT  = -1,
         NONE  =  0,
         RIGHT = +1,
+        DOWN  = +2,
     } selecting = NONE;
     bool inclusive = false; // e.g. 't' or 'f' when finding character
 
-    while (true) {
-        XEvent event;
-        XNextEvent(g_display, &event);
-        if (event.type != KeyPress && event.type != KeyRelease)
-            continue;
+    // ------------------------------------------------------------------------
+    main_event_loop:;
 
-        KeySym key = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
-        if (key == XK_Escape) // temporary convenience while developing
-            exit(EXIT_SUCCESS);
-        printf("Key %s: Keycode=%i, Keysym=%s\n", // TODO temp logging.
-            event.type == KeyPress ? "pressed" : "released",
-            event.xkey.keycode,
-            XKeysymToString(key));
+    XEvent event;
+    XNextEvent(g_display, &event);
+    if (event.type != KeyPress && event.type != KeyRelease)
+        goto main_event_loop;
 
-        XFREE char* focused_instance;
-        Window focused;
-        XGetInputFocus(g_display, &focused, &(int){0}); // ignore revert flag
-        if (focused == None) {
-            XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
-            continue;
+    KeySym key = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
+    if (key == XK_Escape) // temporary convenience while developing
+        exit(EXIT_SUCCESS);
+    printf("Key %s: Keycode=%i, Keysym=%s\n", // TODO temp logging.
+        event.type == KeyPress ? "pressed" : "released",
+        event.xkey.keycode,
+        XKeysymToString(key));
+
+    XFREE char* focused_instance;
+    Window focused;
+    XGetInputFocus(g_display, &focused, &(int){0}); // ignore revert flag
+    if (focused == None) {
+        XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+        goto main_event_loop;
+    }
+    XGetWindowProperty(
+        g_display,
+        focused,
+        WM_CLASS,
+        0, LONG_MAX, False,
+        AnyPropertyType,
+        &(Atom){0}, // ignore type, we know it's a string
+        &(int){0}, // ignore format, we know it's a string
+        &(unsigned long){0}, // ignore length, string null terminated
+        &(unsigned long){0}, // ignore partial read, we don't care
+        (unsigned char**)&focused_instance);
+
+    if (focused_instance == NULL) {
+        XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+        goto main_event_loop;
+    }
+    char* focused_class = focused_instance;
+    focused_class += strlen(focused_instance) + sizeof"";
+    bool found_focused = false;
+    for (size_t i = 0; i < sizeof g_text_editors / sizeof g_text_editors[0]; ++i) {
+        if (strcmp(focused_class, g_text_editors[i]) == 0) {
+            found_focused = true;
+            break;
         }
-        XGetWindowProperty(
-            g_display,
-            focused,
-            WM_CLASS,
-            0, LONG_MAX, False,
-            AnyPropertyType,
-            &(Atom){0}, // ignore type, we know it's a string
-            &(int){0}, // ignore format, we know it's a string
-            &(unsigned long){0}, // ignore length, string null terminated
-            &(unsigned long){0}, // ignore partial read, we don't care
-            (unsigned char**)&focused_instance);
+    }
+    if ( ! found_focused) {
+        XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+        goto main_event_loop;
+    }
 
-        if (focused_instance == NULL) {
-            XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
-            continue;
-        }
-        char* focused_class = focused_instance;
-        focused_class += strlen(focused_instance) + sizeof"";
-        bool found_focused = false;
-        for (size_t i = 0; i < sizeof g_text_editors / sizeof g_text_editors[0]; ++i) {
-            if (strcmp(focused_class, g_text_editors[i]) == 0) {
-                found_focused = true;
-                break;
-            }
-        }
-        if ( ! found_focused) {
-            XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
-            continue;
-        }
+    // Arrow + f/t: Find character.
+    if ( ! selecting) {
+        if (event.type == KeyPress) {
+            char keymap[32];
+            XQueryKeymap(g_display, keymap);
 
-        if ( ! selecting) {
-            if (event.type == KeyPress) {
-                char keymap[32];
-                XQueryKeymap(g_display, keymap);
-
-                if ( ! (key_down(keymap, XK_Left) ^ key_down(keymap, XK_Right))) {
-                    XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
-                    continue;
-                }
-                XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
-                XFlush(g_display);
-
-                inclusive = XKeycodeToKeysym(g_display, event.xkey.keycode, 0) == XK_f;
-                selecting = key_down(keymap, XK_Left) ? LEFT : RIGHT;
-                send_key(focused, selecting == LEFT ? XK_Right : XK_Left, 0); // undo cursor move
-                send_key(focused, selecting == LEFT ? XK_Home : XK_End, ShiftMask);
-            } else { // key release
+            switch (
+                (key_down(keymap, XK_Up   ) << 0) |
+                (key_down(keymap, XK_Left ) << 1) |
+                (key_down(keymap, XK_Right) << 2) |
+                (key_down(keymap, XK_Down ) << 3) )
+            {
+            case 1 << 0: selecting = UP   ; break;
+            case 1 << 1: selecting = LEFT ; break;
+            case 1 << 2: selecting = RIGHT; break;
+            case 1 << 3: selecting = DOWN ; break;
+            default:
                 XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+                goto main_event_loop;
             }
-        } else { // selecting
-            if (event.type == KeyPress) { // repeat triggered or smashing keys
-                XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
-            } else { // key release
-                DATA_FREE Data selection = peek_selection(focused, NULL);
-                if (selection.length == 0 || selection.data[0] == '\n')
-                    goto skip_find;
 
-                send_key(focused, selecting == LEFT ? XK_Right : XK_Left, 0);
+            XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
+            XFlush(g_display);
 
-                int grab_status = XGrabKeyboard(
-                    g_display, g_root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
-                if (grab_status == GrabSuccess) { // get key to find
-                    XEvent event;
-                    KeySym keysym;
-                    char character[32] = "";
-                    Status status;
-                    while (true) {
-                        XNextEvent(g_display, &event);
-                        if (event.type != KeyPress) // remember that release for
-                            continue;               // Xutf8Lookup is undefined.
+            inclusive = XKeycodeToKeysym(g_display, event.xkey.keycode, 0) == XK_f;
 
-                        keysym = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
+            switch (selecting) { // undo cursor move
+            case UP:    send_key(focused, XK_Down,  0); break;
+            case LEFT:  send_key(focused, XK_Right, 0); break;
+            case RIGHT: send_key(focused, XK_Left,  0); break;
+            case DOWN:  send_key(focused, XK_Up,    0); break;
+            case NONE: fail("Unreachable. Line %i\n", __LINE__);
+            }
+            send_key(focused, selecting <= LEFT ? XK_Home : XK_End, ShiftMask);
+        } else { // key release
+            XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+        }
+    } else { // selecting
+        if (event.type == KeyPress) { // repeat triggered or smashing keys
+            XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+        } else { // key release
+            DATA_FREE Data selection = peek_selection(focused, NULL);
+            if (selection.length == 0 || selection.data[0] == '\n')
+                goto skip_find;
 
-                        switch (keysym) {
-                        case XK_F1 ... XK_R15: case XK_Super_L: case XK_Super_R:
-                        case XK_Left: case XK_Right: case XK_Up: case XK_Down:
-                        case XK_Home: case XK_End: case XK_Page_Up: case XK_Page_Down:
-                            // User likely changed their minds and want to do something else.
-                            XUngrabKeyboard(g_display, CurrentTime);
-                            XFlush(g_display);
-                            forward_key(focused, event);
-                            goto skip_find;
+            send_key(focused, selecting <= LEFT ? XK_Right : XK_Left, 0);
 
-                        case XK_Escape: // User likely selected on accident and they
-                                        // just want to cancel, so don't forward key.
-                            XUngrabKeyboard(g_display, CurrentTime);
-                            XFlush(g_display);
-                            goto skip_find;
-                        }
+            int grab_status = XGrabKeyboard(
+                g_display, g_root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+            if (grab_status == GrabSuccess) { // get key to find
+                XEvent event;
+                KeySym keysym;
+                char character[32] = "";
+                Status status;
+                while (true) {
+                    XNextEvent(g_display, &event);
+                    if (event.type != KeyPress) // remember that release for
+                        continue;               // Xutf8Lookup is undefined.
 
-                        Xutf8LookupString(
-                            input_context,
-                            &event.xkey,
-                            character, sizeof character,
-                            &keysym, &status);
+                    keysym = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
 
-                        // Only break if got character, so ignore Shift and stuff.
-                        if (status == XLookupChars || status == XLookupBoth)
-                            break;
-                    }
-                    XUngrabKeyboard(g_display, CurrentTime);
-                    XFlush(g_display);
-                    printf("Finding key '%s' from string %s\n",
-                           character,
-                           selection.data);
-
-                    char* position = strstr(selection.data, character);
-                    if (selecting == LEFT) // find last
-                        for (char* p = position; p != NULL;)
-                            if (((p = strstr(position + 1, character)) != NULL))
-                                position = p;
-
-                    if (position == NULL)
+                    switch (keysym) {
+                    case XK_F1 ... XK_R15: case XK_Super_L: case XK_Super_R:
+                    case XK_Left: case XK_Right: case XK_Up: case XK_Down:
+                    case XK_Home: case XK_End: case XK_Page_Up: case XK_Page_Down:
+                        // User likely changed their minds and want to do something else.
+                        XUngrabKeyboard(g_display, CurrentTime);
+                        XFlush(g_display);
+                        forward_key(focused, event);
                         goto skip_find;
 
-                    if (selecting == RIGHT)
-                        for (ptrdiff_t i = 0; i < position - selection.data + inclusive; i++)
-                            send_key(focused, XK_Right, ShiftMask);
-                    else
-                        for (size_t i = 0;
-                             i + 1 < selection.length - (position - selection.data) + inclusive;
-                            i++
-                        )
-                            send_key(focused, XK_Left, ShiftMask);
-                }
-                skip_find:
-                XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
-            }
-            selecting = NONE;
-        }
+                    case XK_Escape: // User likely selected on accident and they
+                                    // just want to cancel, so don't forward key.
+                        XUngrabKeyboard(g_display, CurrentTime);
+                        XFlush(g_display);
+                        goto skip_find;
+                    }
 
-        XFlush(g_display);
+                    Xutf8LookupString(
+                        input_context,
+                        &event.xkey,
+                        character, sizeof character,
+                        &keysym, &status);
+
+                    // Only break if got character, so ignore Shift and stuff.
+                    if (status == XLookupChars || status == XLookupBoth)
+                        break;
+                }
+                XUngrabKeyboard(g_display, CurrentTime);
+                XFlush(g_display);
+                printf("Finding key '%s' from string %s\n",
+                        character,
+                        selection.data);
+
+                char* position = strstr(selection.data, character);
+                if (selecting <= LEFT) // find last
+                    for (char* p = position; p != NULL;)
+                        if (((p = strstr(position + 1, character)) != NULL))
+                            position = p;
+
+                if (position == NULL && selecting == UP)
+                    position = find_above(focused, &selection, character);
+                if (position == NULL && selecting == DOWN)
+                    position = find_below(focused, &selection, character);
+                if (position == NULL)
+                    goto skip_find;
+
+                switch (selecting) {
+                case RIGHT:
+                    for (char* p = selection.data; p < position + inclusive; p += char_size(p))
+                        send_key(focused, XK_Right, ShiftMask);
+                    break;
+
+                case LEFT:;
+                    for (char* p = selection.data + selection.length;
+                        p - 1 > position - inclusive;
+                        p -= char_size_back(p)
+                    )
+                        send_key(focused, XK_Left, ShiftMask);
+                    break;
+
+                case UP:
+                    fail("Up not implemented.\n");
+                    break;
+
+                case DOWN:
+                    fail("Down not implemented.\n");
+                    break;
+
+                case NONE:
+                    fail("Unreachable. Line %i.\n", __LINE__);
+                }
+            }
+            skip_find:
+            XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
+        }
+        selecting = NONE;
     }
+
+    XFlush(g_display);
+    goto main_event_loop;
 }
