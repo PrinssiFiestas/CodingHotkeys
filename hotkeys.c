@@ -234,20 +234,15 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
         fail("Assumed single codepoint characters.\n");
 
     // Modifiers will cause mayhem when selecting and peeking clipboard.
-    for (bool modifier_down = true; modifier_down; usleep(1000)) {
-        char keymap[32];
+    size_t counter = 0;
+    char keymap[32];
+
+    bool modifier_down; do {
+        modifier_down = false;
         XQueryKeymap(g_display, keymap);
         for (size_t i = 0; i < sizeof MODIFIERS / sizeof MODIFIERS[0]; ++i)
             modifier_down |= key_down(keymap, MODIFIERS[i]);
-    }
-
-    // TODO we should be able to abort search too.
-
-    // We'll just plow trough the whole clipboard IF it doesn't get too slow.
-    // Have to test with large(ihs) files input.
-
-    size_t line = 0; // offset from cursor position
-    char* position = NULL;
+    } while (modifier_down);
 
     // We'll just plow trough the whole clipboard every time. This has some
     // repeated work, but the string search will be fast anyway (think about
@@ -255,7 +250,11 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
     // major simplification, because analyzing the string in parts can slice
     // UTF-8 codepoints, which is a huge pain to deal with.
 
+    counter = 0;
+    char* position = NULL;
     while (position == NULL) {
+        if (counter++ > 150)
+            fail("Selection loop.\n");
         DATA_FREE Data old_selection = data_clone(*selection);
         for (size_t i = 0; i < LINES_TO_ANALYZE; i++)
             send_key(window, XK_Up, ShiftMask);
@@ -265,6 +264,12 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
             return NULL;
 
         position = strstr(selection->data, utf8_character);
+        if (position != NULL)
+            return position;
+
+        XQueryKeymap(g_display, keymap);
+        if (key_down(keymap, XK_Escape)) // TODO use other keys too to abort search?
+            return NULL;
     }
     return position;
 }
@@ -418,7 +423,7 @@ int main(void)
             XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
         } else { // key release
             DATA_FREE Data selection = peek_selection(focused, NULL);
-            if (selection.length == 0 || selection.data[0] == '\n')
+            if (selection.length == 0)
                 goto skip_find;
 
             send_key(focused, selecting <= LEFT ? XK_Right : XK_Left, 0);
