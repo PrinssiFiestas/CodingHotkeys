@@ -44,15 +44,6 @@ Display* g_display;
 Window   g_root;
 Atom     WM_CLASS;
 
-static const KeySym MODIFIERS[] =
-{
-    XK_Meta_L, XK_Meta_R,
-    XK_Alt_L, XK_Alt_R,
-    XK_Super_L, XK_Super_R,
-    XK_Hyper_L, XK_Hyper_R,
-    XK_ISO_Level3_Shift, // AltGr
-};
-
 #define fail(...) exit(!!fprintf(stderr, "hotkeys: "__VA_ARGS__))
 
 void* xmalloc(size_t size)
@@ -194,7 +185,7 @@ Data peek_selection(Window window, Data* optional_buf)
 
     send_key(window, XK_c, ControlMask);
     XFlush(g_display);
-    usleep(1000); // wait for copy to happen
+    usleep(5000); // wait for copy to happen
 
     Data clipboard = get_clipboard(optional_buf);
     set_clipboard(clipboard_backup);
@@ -230,47 +221,61 @@ size_t char_size_back(const char* ptr)
 
 char* find_above(Window window, Data* selection, const char* utf8_character)
 {
-    if (strlen(utf8_character) < 1 || 4 < strlen(utf8_character))
-        fail("Assumed single codepoint characters.\n");
-
-    // Modifiers will cause mayhem when selecting and peeking clipboard.
-    size_t counter = 0;
-    char keymap[32];
-
-    bool modifier_down; do {
-        modifier_down = false;
+    // Wait for all keys to be lifted. We already waited before calling this in
+    // event loop, but the event loop may fail waiting due to key repeat
+    // triggering release events.
+    while (true) {
+        char keymap[32];
         XQueryKeymap(g_display, keymap);
-        for (size_t i = 0; i < sizeof MODIFIERS / sizeof MODIFIERS[0]; ++i)
-            modifier_down |= key_down(keymap, MODIFIERS[i]);
-    } while (modifier_down);
+        if (memcmp(keymap, (char[sizeof keymap]){0}, sizeof keymap) == 0)
+            break;
+    }
 
-    // We'll just plow trough the whole clipboard every time. This has some
-    // repeated work, but the string search will be fast anyway (think about
-    // grep) compared to sending events and waiting for clipboard. This is a
-    // major simplification, because analyzing the string in parts can slice
-    // UTF-8 codepoints, which is a huge pain to deal with.
 
-    counter = 0;
+
     char* position = NULL;
     while (position == NULL) {
-        if (counter++ > 150)
-            fail("Selection loop.\n");
         DATA_FREE Data old_selection = data_clone(*selection);
         for (size_t i = 0; i < LINES_TO_ANALYZE; i++)
             send_key(window, XK_Up, ShiftMask);
 
         peek_selection(window, selection);
-        if (data_equal(*selection, old_selection)) // end of file
+
+        if (data_equal(*selection, old_selection)) { // end of file
+            puts("End of file.");
             return NULL;
+        }
 
+        // We'll just strstr() trough the whole clipboard every time. This has
+        // repeated work, but the string search will be fast anyway (think about
+        // grep) compared to sending events and waiting for clipboard. This is a
+        // major simplification, because analyzing the string in parts can slice
+        // UTF-8 codepoints, which is a huge pain to deal with.
         position = strstr(selection->data, utf8_character);
-        if (position != NULL)
-            return position;
+        //if (selecting <= LEFT) // find last
+            for (char* p = position; p != NULL;)
+                if (((p = strstr(position + 1, utf8_character)) != NULL))
+                    position = p;
 
+        if (position != NULL) {
+            printf("Found character '%s'\n", utf8_character);
+            return position;
+        }
+
+        char keymap[32];
         XQueryKeymap(g_display, keymap);
-        if (key_down(keymap, XK_Escape)) // TODO use other keys too to abort search?
+        if (key_down(keymap, XK_Escape)) {
+            send_key(window, XK_Right, 0);
+            puts("Aborting search.");
+            return NULL;
+        }
+        // Keyboard not grabbed, so the only sensible thing to do if any key
+        // has been pressed is to abort search. Grabbing would work better, but
+        // it's heavy handed, this is an edge case anyway (user panic).
+        if (memcmp(keymap, (char[sizeof keymap]){0}, sizeof keymap) != 0)
             return NULL;
     }
+    fail("Unreachable. Line %i.\n", __LINE__);
     return position;
 }
 
@@ -430,17 +435,38 @@ int main(void)
 
             int grab_status = XGrabKeyboard(
                 g_display, g_root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
-            if (grab_status == GrabSuccess) { // get key to find
-                XEvent event;
-                KeySym keysym;
-                char character[32] = "";
-                Status status;
-                while (true) {
-                    XNextEvent(g_display, &event);
-                    if (event.type != KeyPress) // remember that release for
-                        continue;               // Xutf8Lookup is undefined.
+            if (grab_status != GrabSuccess)
+                goto skip_find; // else get character key to find
 
-                    keysym = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
+            XEvent event;
+            KeySym keysym;
+            char utf8_character[32] = "";
+            Status status;
+
+            // find_above()/below() requires that no key is held down while it
+            // does it's thing. Using XQueryKeymap() alone is not reliable, it
+            // may lag, so we check press/release events here instead and use
+            // XQueryKeymap() during finding operation.
+            bool keys_down[255] = {0}; // index is keycode
+            static const char EMPTY_BYTES[sizeof keys_down] = "";
+            // Checking if any key down using keycodes should be enough, so
+            // checking modifier mask too is a bit paranoid, but this double
+            // check makes sure that no modifiers really really are down before
+            // finding above/below, which would cause mayhem otherwise.
+            unsigned modifiers = 0;
+
+            bool got_key = false;
+
+            while (true) {
+                XNextEvent(g_display, &event);
+                if (event.type != KeyPress && event.type != KeyRelease)
+                    continue;
+
+                keysym = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
+
+                if (event.type == KeyPress) {
+                    keys_down[event.xkey.keycode] = true;
+                    modifiers |= event.xkey.state;
 
                     switch (keysym) {
                     case XK_F1 ... XK_R15: case XK_Super_L: case XK_Super_R:
@@ -462,58 +488,75 @@ int main(void)
                     Xutf8LookupString(
                         input_context,
                         &event.xkey,
-                        character, sizeof character,
+                        utf8_character, sizeof utf8_character,
                         &keysym, &status);
 
-                    // Only break if got character, so ignore Shift and stuff.
-                    if (status == XLookupChars || status == XLookupBoth)
+                    if (status != XLookupChars && status != XLookupBoth)
+                        continue;
+                    got_key = true;
+
+                    // Find above and below has to wait for all keys to be
+                    // lifted, but finding in line does not.
+                    if (LEFT <= selecting && selecting <= RIGHT)
+                        break;
+
+                } else if (event.type == KeyRelease) {
+                    keys_down[event.xkey.keycode] = false;
+                    modifiers &= ~event.xkey.state;
+                    if (got_key
+                        && modifiers == 0
+                        && memcmp(keys_down, EMPTY_BYTES, sizeof keys_down) == 0)
                         break;
                 }
-                XUngrabKeyboard(g_display, CurrentTime);
-                XFlush(g_display);
-                printf("Finding key '%s' from string %s\n",
-                        character,
-                        selection.data);
-
-                char* position = strstr(selection.data, character);
-                if (selecting <= LEFT) // find last
-                    for (char* p = position; p != NULL;)
-                        if (((p = strstr(position + 1, character)) != NULL))
-                            position = p;
-
-                if (position == NULL && selecting == UP)
-                    position = find_above(focused, &selection, character);
-                if (position == NULL && selecting == DOWN)
-                    position = find_below(focused, &selection, character);
-                if (position == NULL)
-                    goto skip_find;
-
-                switch (selecting) {
-                case RIGHT:
-                    for (char* p = selection.data; p < position + inclusive; p += char_size(p))
-                        send_key(focused, XK_Right, ShiftMask);
-                    break;
-
-                case LEFT:;
-                    for (char* p = selection.data + selection.length;
-                        p - 1 > position - inclusive;
-                        p -= char_size_back(p)
-                    )
-                        send_key(focused, XK_Left, ShiftMask);
-                    break;
-
-                case UP:
-                    fail("Up not implemented.\n");
-                    break;
-
-                case DOWN:
-                    fail("Down not implemented.\n");
-                    break;
-
-                case NONE:
-                    fail("Unreachable. Line %i.\n", __LINE__);
-                }
             }
+            XUngrabKeyboard(g_display, CurrentTime);
+            XFlush(g_display);
+            printf("Finding key '%s' from string %s\n",
+                    utf8_character,
+                    selection.data);
+
+            char* position = strstr(selection.data, utf8_character);
+            if (selecting <= LEFT) // find last
+                for (char* p = position; p != NULL;)
+                    if (((p = strstr(position + 1, utf8_character)) != NULL))
+                        position = p;
+
+            if (position == NULL && selecting == UP)
+                position = find_above(focused, &selection, utf8_character);
+            if (position == NULL && selecting == DOWN)
+                position = find_below(focused, &selection, utf8_character);
+            if (position == NULL)
+                goto skip_find;
+
+            switch (selecting) {
+            case RIGHT: case UP:
+                for (char* p = selection.data;
+                     p < position + (inclusive^(selecting==UP));
+                    p += char_size(p)
+                )
+                    send_key(focused, XK_Right, ShiftMask);
+                break;
+
+            case LEFT:;
+                for (char* p = selection.data + selection.length;
+                    p - 1 > position - inclusive;
+                    p -= char_size_back(p)
+                )
+                    send_key(focused, XK_Left, ShiftMask);
+                break;
+
+            //case UP:
+            //    fail("Up not implemented.\n");
+            //    break;
+
+            case DOWN:
+                fail("Down not implemented.\n");
+                break;
+
+            case NONE:
+                fail("Unreachable. Line %i.\n", __LINE__);
+            }
+
             skip_find:
             XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
         }
