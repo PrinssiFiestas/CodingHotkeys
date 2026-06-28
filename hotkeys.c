@@ -219,7 +219,8 @@ size_t char_size_back(const char* ptr)
     return ptr - p1;
 }
 
-char* find_above(Window window, Data* selection, const char* utf8_character)
+char* find_above_or_below(
+    Window window, Data* selection, const char* utf8_character, bool above)
 {
     // Wait for all keys to be lifted. We already waited before calling this in
     // event loop, but the event loop may fail waiting due to key repeat
@@ -231,16 +232,13 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
             break;
     }
 
-
-
     char* position = NULL;
     while (position == NULL) {
         DATA_FREE Data old_selection = data_clone(*selection);
         for (size_t i = 0; i < LINES_TO_ANALYZE; i++)
-            send_key(window, XK_Up, ShiftMask);
+            send_key(window, above ? XK_Up : XK_Down, ShiftMask);
 
         peek_selection(window, selection);
-
         if (data_equal(*selection, old_selection)) { // end of file
             puts("End of file.");
             return NULL;
@@ -252,7 +250,7 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
         // major simplification, because analyzing the string in parts can slice
         // UTF-8 codepoints, which is a huge pain to deal with.
         position = strstr(selection->data, utf8_character);
-        //if (selecting <= LEFT) // find last
+        if (above) // find last
             for (char* p = position; p != NULL;)
                 if (((p = strstr(position + 1, utf8_character)) != NULL))
                     position = p;
@@ -265,7 +263,7 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
         char keymap[32];
         XQueryKeymap(g_display, keymap);
         if (key_down(keymap, XK_Escape)) {
-            send_key(window, XK_Right, 0);
+            send_key(window, above ? XK_Right : XK_Left, 0);
             puts("Aborting search.");
             return NULL;
         }
@@ -277,12 +275,6 @@ char* find_above(Window window, Data* selection, const char* utf8_character)
     }
     fail("Unreachable. Line %i.\n", __LINE__);
     return position;
-}
-
-char* find_below(Window window, Data* selection, const char* utf8_character)
-{
-    // TODO TEMP
-    return find_above(window, selection, utf8_character);
 }
 
 int main(void)
@@ -521,10 +513,9 @@ int main(void)
                     if (((p = strstr(position + 1, utf8_character)) != NULL))
                         position = p;
 
-            if (position == NULL && selecting == UP)
-                position = find_above(focused, &selection, utf8_character);
-            if (position == NULL && selecting == DOWN)
-                position = find_below(focused, &selection, utf8_character);
+            if (position == NULL && (selecting == UP || selecting == DOWN))
+                position = find_above_or_below(
+                    focused, &selection, utf8_character, selecting == UP);
             if (position == NULL)
                 goto skip_find;
 
@@ -537,20 +528,12 @@ int main(void)
                     send_key(focused, XK_Right, ShiftMask);
                 break;
 
-            case LEFT:;
+            case LEFT: case DOWN:
                 for (char* p = selection.data + selection.length;
-                    p - 1 > position - inclusive;
+                    p - 1 > position - (inclusive^(selecting==DOWN));
                     p -= char_size_back(p)
                 )
                     send_key(focused, XK_Left, ShiftMask);
-                break;
-
-            //case UP:
-            //    fail("Up not implemented.\n");
-            //    break;
-
-            case DOWN:
-                fail("Down not implemented.\n");
                 break;
 
             case NONE:
