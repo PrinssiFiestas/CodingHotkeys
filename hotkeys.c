@@ -221,7 +221,7 @@ Data peek_selection(Window window, Data* optional_buf)
 
     send_key(window, XK_c, ControlMask);
     XFlush(g_display);
-    usleep(100*10*1000); // wait for copy to happen
+    usleep(10*1000); // wait for copy to happen
 
     Data clipboard = get_clipboard(optional_buf);
     set_clipboard(clipboard_backup);
@@ -283,7 +283,6 @@ char* find_above_or_below(
         for (size_t i = 0; i < LINES_TO_ANALYZE; i++)
             send_key(window, selecting <= UP ? XK_Up : XK_Down, ShiftMask);
 
-        usleep(1500*1000); // TODO
         peek_selection(window, selection);
         if (data_equal(*selection, old_selection)) { // end of file
             puts("End of file.");
@@ -435,8 +434,9 @@ int main(void)
                     selecting = BRACKET; // direction determined later
                     inclusive = key == XK_a;
                     XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
-                } else // TODO Async or Replay breaks either ai or å§
+                } else
                     XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
+                XFlush(g_display);
                 goto main_event_loop;
             }
 
@@ -480,6 +480,8 @@ int main(void)
                 XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
         }
     } else { // selecting
+        alternative_modifier_down = false; // release event above skipped, set manually
+
         if (event.type == KeyPress) { // key repeat or smashing keys
             XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
             selecting = NONE;
