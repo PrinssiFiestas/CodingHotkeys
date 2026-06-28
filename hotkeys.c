@@ -29,6 +29,23 @@ typedef struct
     char*  data;
 } Data;
 
+// Negatives go back (line/column decreases), positives go forward (line/column
+// increases).
+enum selecting_info {
+    LEFT_BRACKET  = -3,
+    UP            = -2,
+    LEFT          = -1,
+    NONE          =  0,
+    RIGHT         = +1,
+    DOWN          = +2,
+    RIGHT_BRACKET = +3,
+};
+
+// Absolute values of the enum above.
+#define SAME_LINE  1
+#define OTHER_LINE 2
+#define BRACKET    3
+
 // Only trigger hotkeys if window in keyboard focus is one of these.
 const char* g_text_editors[] =
 {
@@ -36,6 +53,17 @@ const char* g_text_editors[] =
     "Typora",
     "Brave-browser", // mostly for Shadertoy
 };
+
+// Least significant bit of index controls if left or right.
+static const char* BRACKETS[] = {
+    "(", ")",
+    "[", "]",
+    "{", "}",
+    "<", ">",
+    "'", "'",
+    "\"", "\"",
+};
+#define RIGHT_BIT 1
 
 // Analyzing multiple lines at once on multi-line operations is faster, but may
 // introduce annoying scrolling.
@@ -51,7 +79,7 @@ void* xmalloc(size_t size)
 {
     void* p = malloc(size);
     if (p == NULL)
-        fail("Out of memory.\n");
+        fail("malloc(): %s.\n", strerror(errno));
     return p;
 }
 
@@ -59,7 +87,7 @@ void* xrealloc(void* p, size_t size)
 {
     p = realloc(p, size);
     if (p == NULL)
-        fail("Out of memory.\n");
+        fail("realloc(): %s.\n", strerror(errno));
     return p;
 }
 
@@ -127,6 +155,8 @@ void send_key(Window window, KeySym key, unsigned mask)
     send_key_release(window, key, mask);
 }
 
+// This is mostly used with async grabs, sync grabs should forward using
+// XAllowEvents().
 void forward_key(Window window, XEvent event)
 {
     event.xkey.window    = window;
@@ -182,13 +212,16 @@ void set_clipboard(Data data)
 // synthetic key events, so we'll explicitly copy instead, but we have to
 // backup clipboard and store it back, so our peeking doesn't interfere with
 // clipboard.
+//
+// Because we are sending Ctrl+C, we should make sure to call this only if
+// something is selected, otherwise the contents will be old junk.
 Data peek_selection(Window window, Data* optional_buf)
 {
     DATA_FREE Data clipboard_backup = get_clipboard(NULL);
 
     send_key(window, XK_c, ControlMask);
     XFlush(g_display);
-    usleep(10*1000); // wait for copy to happen
+    usleep(100*10*1000); // wait for copy to happen
 
     Data clipboard = get_clipboard(optional_buf);
     set_clipboard(clipboard_backup);
@@ -223,8 +256,17 @@ size_t char_size_back(const char* ptr)
 }
 
 char* find_above_or_below(
-    Window window, Data* selection, const char* utf8_character, bool above)
+    Window window,
+    Data* selection,
+    const char* utf8_character,
+    enum selecting_info selecting,
+    size_t* bracket_nesting_level)
 {
+    size_t dummy_output = 0;
+    if (bracket_nesting_level == NULL)
+        bracket_nesting_level = &dummy_output;
+    size_t nesting_level = *bracket_nesting_level;
+
     // Wait for all keys to be lifted. We already waited before calling this in
     // event loop, but the event loop may fail waiting due to key repeat
     // triggering release events.
@@ -239,8 +281,9 @@ char* find_above_or_below(
     while (position == NULL) {
         DATA_FREE Data old_selection = data_clone(*selection);
         for (size_t i = 0; i < LINES_TO_ANALYZE; i++)
-            send_key(window, above ? XK_Up : XK_Down, ShiftMask);
+            send_key(window, selecting <= UP ? XK_Up : XK_Down, ShiftMask);
 
+        usleep(1500*1000); // TODO
         peek_selection(window, selection);
         if (data_equal(*selection, old_selection)) { // end of file
             puts("End of file.");
@@ -253,7 +296,7 @@ char* find_above_or_below(
         // major simplification, because analyzing the string in parts can slice
         // UTF-8 codepoints, which is a huge pain to deal with.
         position = strstr(selection->data, utf8_character);
-        if (above) // find last
+        if (selecting <= UP) // find last
             for (char* p = position; p != NULL;)
                 if (((p = strstr(position + 1, utf8_character)) != NULL))
                     position = p;
@@ -266,7 +309,7 @@ char* find_above_or_below(
         char keymap[32];
         XQueryKeymap(g_display, keymap);
         if (key_down(keymap, XK_Escape)) {
-            send_key(window, above ? XK_Right : XK_Left, 0);
+            send_key(window, selecting <= UP ? XK_Right : XK_Left, 0);
             puts("Aborting search.");
             return NULL;
         }
@@ -319,20 +362,8 @@ int main(void)
             g_root, False, GrabModeAsync, GrabModeSync);
     }
 
-    // Hotkey state.
-    // Negatives go back, positives go forward, which is nicer for logic than
-    // using KeySym constants.
-    enum {
-        LEFT_BRACKET  = -3,
-        UP            = -2,
-        LEFT          = -1,
-        NONE          =  0,
-        RIGHT         = +1,
-        DOWN          = +2,
-        RIGHT_BRACKET = +3,
-    } selecting = NONE;
+    enum selecting_info selecting = NONE;
     bool inclusive = false; // e.g. 't' or 'f' when finding character
-
     bool alternative_modifier_down = false; // not Alt, but our custom modifier
 
     // ------------------------------------------------------------------------
@@ -391,17 +422,20 @@ int main(void)
     if ( ! selecting) {
         if (event.type == KeyPress) {
             switch(key) {
-            case XK_section: case XK_aring: // FIXME: not handling both modifiers
-                alternative_modifier_down = true;  // down simultaneously.
+            // FIXME: both modifiers would need their own flags, this breaks
+            // if both are down simultaneously.
+            case XK_section: case XK_aring:
+                alternative_modifier_down = true;
                 XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
                 XFlush(g_display);
                 goto main_event_loop;
 
             case XK_i: case XK_a:
                 if (alternative_modifier_down) {
-                    selecting = RIGHT_BRACKET;
+                    selecting = BRACKET; // direction determined later
+                    inclusive = key == XK_a;
                     XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
-                } else
+                } else // TODO Async or Replay breaks either ai or å§
                     XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
                 goto main_event_loop;
             }
@@ -409,7 +443,7 @@ int main(void)
             char keymap[32];
             XQueryKeymap(g_display, keymap);
 
-            switch (
+            switch ( // make sure that only one arrow pressed.
                 (key_down(keymap, XK_Up   ) << 0) |
                 (key_down(keymap, XK_Left ) << 1) |
                 (key_down(keymap, XK_Right) << 2) |
@@ -419,7 +453,7 @@ int main(void)
             case 1 << 1: selecting = LEFT ; break;
             case 1 << 2: selecting = RIGHT; break;
             case 1 << 3: selecting = DOWN ; break;
-            default:
+            default: // multiple arrows pressed
                 XAllowEvents(g_display, ReplayKeyboard, CurrentTime);
                 goto main_event_loop;
             }
@@ -427,9 +461,9 @@ int main(void)
             XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
             XFlush(g_display);
 
-            inclusive = XKeycodeToKeysym(g_display, event.xkey.keycode, 0) == XK_f;
+            inclusive = key == XK_f;
 
-            switch (selecting) { // undo cursor move
+            switch (selecting) { // undo arrow press / cursor move
             case UP:    send_key(focused, XK_Down,  0); break;
             case LEFT:  send_key(focused, XK_Right, 0); break;
             case RIGHT: send_key(focused, XK_Left,  0); break;
@@ -439,7 +473,7 @@ int main(void)
             }
             send_key(focused, selecting <= LEFT ? XK_Home : XK_End, ShiftMask);
         } else { // key release
-            if (alternative_modifier_down) {
+            if (key == XK_section || key == XK_aring) {
                 alternative_modifier_down = false;
                 XAllowEvents(g_display, AsyncKeyboard, CurrentTime);
             } else
@@ -452,114 +486,106 @@ int main(void)
             goto main_event_loop;
         } // else key release
 
-        DATA_FREE Data selection = peek_selection(focused, NULL);
-        if (selection.length == 0) // shouldn't happen, but doesn't hurt to handle
-            goto skip_find;
+        // Kate copies line if no selection and peek_selection() sends Ctrl+C.
+        // Nothing is selected if finding brackets, so initialize accordingly.
+        DATA_FREE Data selection = selecting != BRACKET ?
+            peek_selection(focused, NULL)
+          : (Data){.capacity = 1, .data = memset(xmalloc(1), 0, 1) };
 
         // Unselect line and get back to starting position.
-        if (selecting != RIGHT_BRACKET)
+        if (selecting != BRACKET)
             send_key(focused, selecting <= LEFT ? XK_Right : XK_Left, 0);
 
         int grab_status = XGrabKeyboard(
             g_display, g_root, False, GrabModeAsync, GrabModeAsync, CurrentTime);
         if (grab_status != GrabSuccess) // probably somebody else grabbing.
-            goto skip_find; // else get character key to find
+            goto skip_find;
 
-        XEvent event;
-        KeySym keysym;
         char utf8_character[32] = "";
-        Status status;
 
         // find_above()/below() requires that no key is held down while it
         // does it's thing. Using XQueryKeymap() alone is not reliable, it
         // may lag, so we check press/release events here instead and use
         // XQueryKeymap() during finding operation.
-        bool keys_down[255] = {0}; // index is keycode
-        static const char EMPTY_BYTES[sizeof keys_down] = "";
+        bool keys_down[(KeyCode)-1] = {0};
         // Checking if any key down using keycodes should be enough, so
         // checking modifier mask too is a bit paranoid, but this double
         // check makes sure that no modifiers really really are down before
         // finding above/below, which would cause mayhem otherwise.
         unsigned modifiers = 0;
 
-        // Least significant bit of index controls if left or right.
-        static const char* BRACKETS[] = {
-            "(", ")",
-            "[", "]",
-            "{", "}",
-            "<", ">",
-            "'", "'",
-            "\"", "\"",
-        };
         size_t bracket = 0; // index to BRACKETS
         bool got_key = false;
 
         while (true) {
+            XEvent event;
             XNextEvent(g_display, &event);
             if (event.type != KeyPress && event.type != KeyRelease)
                 continue;
 
-            keysym = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
-
-            if (event.type == KeyPress) {
-                keys_down[event.xkey.keycode] = true;
-                modifiers |= event.xkey.state;
-
-                switch (keysym) {
-                case XK_F1 ... XK_R15: case XK_Super_L: case XK_Super_R:
-                case XK_Left: case XK_Right: case XK_Up: case XK_Down:
-                case XK_Home: case XK_End: case XK_Page_Up: case XK_Page_Down:
-                    // User likely changed their minds and want to do something else.
-                    XUngrabKeyboard(g_display, CurrentTime);
-                    XFlush(g_display);
-                    forward_key(focused, event);
-                    goto skip_find;
-
-                case XK_Escape: // User likely selected on accident and they
-                                // just want to cancel, so don't forward key.
-                    XUngrabKeyboard(g_display, CurrentTime);
-                    XFlush(g_display);
-                    goto skip_find;
-                }
-
-                Xutf8LookupString(
-                    input_context,
-                    &event.xkey,
-                    utf8_character, sizeof utf8_character,
-                    &keysym, &status);
-
-                // We need a fully formed character, try again if key was shift or something.
-                if (status != XLookupChars && status != XLookupBoth)
-                    continue;
-
-                if (selecting == RIGHT_BRACKET)
-                    for (; bracket < sizeof BRACKETS / sizeof BRACKETS[0]; bracket++)
-                        if (strcmp(BRACKETS[bracket], utf8_character) == 0)
-                            break;
-                if (bracket >= sizeof BRACKETS / sizeof BRACKETS[0]) { // key not bracket
-                    XUngrabKeyboard(g_display, CurrentTime);
-                    XFlush(g_display);
-                    goto skip_find;
-                }
-                if (selecting == RIGHT_BRACKET) {
-                    strcpy(utf8_character, BRACKETS[bracket | 1]);
-                }
-
-                got_key = true;
-
-                // Find above and below has to wait for all keys to be
-                // lifted, but finding in line does not.
-                if (selecting == LEFT || selecting == RIGHT)
-                    break;
-
-            } else if (event.type == KeyRelease) {
+            if (event.type == KeyRelease) {
                 keys_down[event.xkey.keycode] = false;
                 modifiers &= ~event.xkey.state;
                 if (got_key
                     && modifiers == 0
-                    && memcmp(keys_down, EMPTY_BYTES, sizeof keys_down) == 0)
+                    && memcmp(
+                        keys_down, (char[sizeof keys_down]){0}, sizeof keys_down) == 0
+                    ) {
                     break;
+                }
+                continue;
             }
+
+            KeySym keysym = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
+            keys_down[event.xkey.keycode] = true;
+            modifiers |= event.xkey.state;
+
+            switch (keysym) {
+            case XK_F1 ... XK_R15: case XK_Super_L: case XK_Super_R:
+            case XK_Left: case XK_Right: case XK_Up: case XK_Down:
+            case XK_Home: case XK_End: case XK_Page_Up: case XK_Page_Down:
+                // User likely changed their minds and want to do something else.
+                XUngrabKeyboard(g_display, CurrentTime);
+                XFlush(g_display);
+                forward_key(focused, event);
+                goto skip_find;
+
+            case XK_Escape: // User likely selected on accident and they
+                            // just want to cancel, so don't forward key.
+                XUngrabKeyboard(g_display, CurrentTime);
+                XFlush(g_display);
+                goto skip_find;
+            }
+
+            Status status;
+            Xutf8LookupString(
+                input_context,
+                &event.xkey,
+                utf8_character, sizeof utf8_character,
+                &keysym, &status);
+
+            // We need a fully formed character, try again if key was shift or something.
+            if (status != XLookupChars && status != XLookupBoth)
+                continue;
+
+            if (selecting == BRACKET) {
+                for (; bracket < sizeof BRACKETS / sizeof BRACKETS[0]; bracket++)
+                    if (BRACKETS[bracket][0] == utf8_character[0])
+                        break;
+                if (bracket >= sizeof BRACKETS / sizeof BRACKETS[0]) {
+                    XUngrabKeyboard(g_display, CurrentTime);
+                    XFlush(g_display);
+                    goto skip_find;
+                }
+                selecting = bracket & RIGHT_BIT ? RIGHT_BRACKET : LEFT_BRACKET;
+            }
+
+            got_key = true;
+
+            // Find above, below, and bracket has to wait for all keys to be
+            // lifted, but finding in line does not.
+            if (abs(selecting) == SAME_LINE)
+                break;
         }
         XUngrabKeyboard(g_display, CurrentTime);
         XFlush(g_display);
@@ -574,9 +600,14 @@ int main(void)
                 if (((p = strstr(position + 1, utf8_character)) != NULL))
                     position = p;
 
-        if (position == NULL && (selecting == UP || selecting == DOWN)) {
+        size_t nesting_depth = 0;
+        if (abs(selecting) == BRACKET) { // First find opposing, matching later
             position = find_above_or_below(
-                focused, &selection, utf8_character, selecting == UP);
+                focused, &selection, BRACKETS[bracket ^ RIGHT_BIT], -selecting, &nesting_depth);
+            inclusive ^= 1;
+        } else if (position == NULL && abs(selecting) == OTHER_LINE) {
+            position = find_above_or_below(
+                focused, &selection, utf8_character, selecting, NULL);
             // If found above/below instead from line, then we don't select from
             // starting position to end position, we switch directions: start
             // from other side of selection and unselect to position.
@@ -586,8 +617,9 @@ int main(void)
         if (position == NULL)
             goto skip_find;
 
+        select_other: // come back in case we have to select matching bracket.
         switch (selecting) {
-        case RIGHT: case DOWN:
+        case RIGHT: case DOWN: case RIGHT_BRACKET:
             for (char* p = selection.data;
                 p < position + inclusive;
                 p += char_size(p)
@@ -595,7 +627,7 @@ int main(void)
                 send_key(focused, XK_Right, ShiftMask);
             break;
 
-        case LEFT: case UP: case RIGHT_BRACKET:
+        case LEFT: case UP: case LEFT_BRACKET:
             for (char* p = selection.data + selection.length;
                 p - 1 > position - inclusive;
                 p -= char_size_back(p)
@@ -603,8 +635,20 @@ int main(void)
                 send_key(focused, XK_Left, ShiftMask);
             break;
 
-        case NONE: case LEFT_BRACKET:
+        case NONE:
             fail("Unreachable. Line %i.\n", __LINE__);
+        }
+
+        if (abs(selecting) == BRACKET) { // find matching
+            send_key(focused, bracket & RIGHT_BIT ? XK_Left : XK_Right, 0);
+            XFlush(g_display);
+            position = find_above_or_below(
+                focused, &selection, BRACKETS[bracket], selecting, &nesting_depth);
+            if (position == NULL)
+                goto skip_find;
+
+            selecting = bracket & RIGHT_BIT ? LEFT : RIGHT;
+            goto select_other;
         }
 
         skip_find:
