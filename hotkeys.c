@@ -222,6 +222,7 @@ Data peek_selection(Window window, Data* optional_buf)
     send_key(window, XK_c, ControlMask);
     XFlush(g_display);
     usleep(10*1000); // wait for copy to happen
+    usleep(1000*1000); // TODO TEMP
 
     Data clipboard = get_clipboard(optional_buf);
     set_clipboard(clipboard_backup);
@@ -255,17 +256,34 @@ size_t char_size_back(const char* ptr)
     return ptr - p1;
 }
 
+// Time complexity: O(don't care)
+char* strstr_last(const char* haystack, const char* needle, const char* optional_end)
+{
+    const char* position = strstr(haystack, needle);
+    for (const char* p = position; p != NULL; )
+        if (((p = strstr(position + strlen(needle), needle)) != NULL))
+            position = p;
+    if (optional_end != NULL && position >= optional_end)
+        return NULL;
+    return (char*)position;
+}
+
 char* find_above_or_below(
     Window window,
     Data* selection,
     const char* utf8_character,
     enum selecting_info selecting,
-    size_t* bracket_nesting_level)
+    bool inclusive_match) // ignore the bracket that we are matching to
 {
-    size_t dummy_output = 0;
-    if (bracket_nesting_level == NULL)
-        bracket_nesting_level = &dummy_output;
-    size_t nesting_level = *bracket_nesting_level;
+    const char* left  = NULL;
+    const char* right = NULL;
+    for (size_t i = 0; i < sizeof BRACKETS / sizeof BRACKETS[0]; i++) {
+        if (utf8_character[0] != BRACKETS[i][0])
+            continue;
+        left  = BRACKETS[i & ~RIGHT_BIT];
+        right = BRACKETS[i |  RIGHT_BIT];
+        break;
+    }
 
     // Wait for all keys to be lifted. We already waited before calling this in
     // event loop, but the event loop may fail waiting due to key repeat
@@ -289,19 +307,59 @@ char* find_above_or_below(
             return NULL;
         }
 
-        // We'll just strstr() trough the whole clipboard every time. This has
-        // repeated work, but the string search will be fast anyway (think about
-        // grep) compared to sending events and waiting for clipboard. This is a
-        // major simplification, because analyzing the string in parts can slice
-        // UTF-8 codepoints, which is a huge pain to deal with.
-        position = strstr(selection->data, utf8_character);
-        if (selecting <= UP) // find last
-            for (char* p = position; p != NULL;)
-                if (((p = strstr(position + 1, utf8_character)) != NULL))
-                    position = p;
+        // Our string processing is horribly inefficient, whatever.
+
+        size_t nesting = -inclusive_match;
+        switch (selecting) {
+        case DOWN:
+            position = strstr(selection->data, utf8_character);
+            break;
+        case UP:
+            position = strstr_last(selection->data, utf8_character, NULL);
+            break;
+
+        case RIGHT_BRACKET:
+            for (char* p = selection->data; *p != '\0'; ) {
+                if (strncmp(p, left, strlen(left)) == 0) {
+                    nesting++;
+                    p += strlen(left);
+                } else if (strncmp(p, right, strlen(right)) == 0) {
+                    if ( ! nesting) {
+                        position = p;
+                        break;
+                    }
+                    nesting--;
+                    p += strlen(right);
+                } else
+                    p++;
+            }
+            break;
+
+        case LEFT_BRACKET: // TODO looking from the last character, but we should
+                           // use a similar method to strstr_last() instead.
+            for (char* p = selection->data + selection->length - 1; p >= selection->data; ) {
+                if (strncmp(p, right, strlen(right)) == 0) {
+                    nesting++;
+                    p -= strlen(right);
+                } else if (strncmp(p, left, strlen(left)) == 0) {
+                    if ( ! nesting) {
+                        position = p;
+                        break;
+                    }
+                    nesting--;
+                    p -= strlen(left);
+                } else
+                    p--;
+            }
+            break;
+
+        case LEFT ... RIGHT:
+            fail("Unreachable. Line %i.\n", __LINE__);
+        }
 
         if (position != NULL) {
             printf("Found character '%s'\n", utf8_character);
+            printf("Nesting level: %zi\n", nesting);
             return position;
         }
 
@@ -602,14 +660,13 @@ int main(void)
                 if (((p = strstr(position + 1, utf8_character)) != NULL))
                     position = p;
 
-        size_t nesting_depth = 0;
         if (abs(selecting) == BRACKET) { // First find opposing, matching later
             position = find_above_or_below(
-                focused, &selection, BRACKETS[bracket ^ RIGHT_BIT], -selecting, &nesting_depth);
-            inclusive ^= 1;
+                focused, &selection, BRACKETS[bracket ^ RIGHT_BIT], -selecting, false);
+            inclusive ^= 1; // see comment below
         } else if (position == NULL && abs(selecting) == OTHER_LINE) {
             position = find_above_or_below(
-                focused, &selection, utf8_character, selecting, NULL);
+                focused, &selection, utf8_character, selecting, false);
             // If found above/below instead from line, then we don't select from
             // starting position to end position, we switch directions: start
             // from other side of selection and unselect to position.
@@ -625,16 +682,16 @@ int main(void)
             for (char* p = selection.data;
                 p < position + inclusive;
                 p += char_size(p)
-            )
-                send_key(focused, XK_Right, ShiftMask);
+            ) // TODO sleep and flush
+                usleep(10*1000), send_key(focused, XK_Right, ShiftMask), XFlush(g_display);
             break;
 
         case LEFT: case UP: case LEFT_BRACKET:
             for (char* p = selection.data + selection.length;
                 p - 1 > position - inclusive;
                 p -= char_size_back(p)
-            )
-                send_key(focused, XK_Left, ShiftMask);
+            ) // TODO sleep and flush
+                usleep(10*100), send_key(focused, XK_Left, ShiftMask), XFlush(g_display);
             break;
 
         case NONE:
@@ -642,10 +699,27 @@ int main(void)
         }
 
         if (abs(selecting) == BRACKET) { // find matching
-            send_key(focused, bracket & RIGHT_BIT ? XK_Left : XK_Right, 0);
-            XFlush(g_display);
+            puts("Going back.");
+            usleep(3000*1000); // TODO
+
+            // Send key to go to the opposite bracket found.
+            // Edge case: If starting non-inclusive search right before the bracket
+            // to search, then the first selection will end up empty, so we don't
+            // want to send key to get there, we already are there. Note that
+            // we had to flip the bit before, which is why the check is negated.
+            bool go_to_bracket = !inclusive;
+            if (!!inclusive)
+                go_to_bracket = (selecting == LEFT_BRACKET) ?
+                    (position != selection.data)
+                  : (position != selection.data + selection.length - 1);
+            if (go_to_bracket) {
+                send_key(focused, bracket & RIGHT_BIT ? XK_Left : XK_Right, 0);
+                XFlush(g_display);
+            }
+            usleep(400*1000);
+
             position = find_above_or_below(
-                focused, &selection, BRACKETS[bracket], selecting, &nesting_depth);
+                focused, &selection, BRACKETS[bracket], selecting, !inclusive);
             if (position == NULL)
                 goto skip_find;
 
