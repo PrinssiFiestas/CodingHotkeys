@@ -307,14 +307,25 @@ char* find_above_or_below(
             return NULL;
         }
 
-        // Our string processing is horribly inefficient, whatever.
-
+        // NOTE: Quotes cannot be sensibly matched without analyzing language
+        // semantics of the whole file. Therefore, we'll just assume that we are
+        // inside string and find the closest ones that are not escaped.
+        // TODO: Checking at least for escaped quotes would be better than no
+        // semantic analysis at all.
         size_t nesting = -inclusive_match;
-        switch (selecting) {
+        bool matching_quotes = abs(selecting) == BRACKET && strcmp(left, right) == 0;
+        enum selecting_info matching = selecting;
+        if (matching_quotes)
+            matching = selecting == RIGHT_BRACKET ? DOWN : UP;
+        bool jump_over_quote = matching_quotes && inclusive_match;
+
+        switch (matching) {
         case DOWN:
-            position = strstr(selection->data, utf8_character);
+            position = strstr(selection->data + jump_over_quote, utf8_character);
             break;
         case UP:
+            if (jump_over_quote) // truncate selected quote away
+                selection->data[--selection->length] = '\0';
             position = strstr_last(selection->data, utf8_character, NULL);
             break;
 
@@ -359,7 +370,6 @@ char* find_above_or_below(
 
         if (position != NULL) {
             printf("Found character '%s'\n", utf8_character);
-            printf("Nesting level: %zi\n", nesting);
             return position;
         }
 
