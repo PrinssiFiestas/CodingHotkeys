@@ -330,37 +330,30 @@ char* find_above_or_below(
             break;
 
         case RIGHT_BRACKET:
-            for (char* p = selection->data; *p != '\0'; ) {
-                if (strncmp(p, left, strlen(left)) == 0) {
+            for (char* p = selection->data; *p != '\0'; p++) {
+                if (strncmp(p, left, strlen(left)) == 0)
                     nesting++;
-                    p += strlen(left);
-                } else if (strncmp(p, right, strlen(right)) == 0) {
+                else if (strncmp(p, right, strlen(right)) == 0) {
                     if ( ! nesting) {
                         position = p;
                         break;
                     }
                     nesting--;
-                    p += strlen(right);
-                } else
-                    p++;
+                }
             }
             break;
 
-        case LEFT_BRACKET: // TODO looking from the last character, but we should
-                           // use a similar method to strstr_last() instead.
-            for (char* p = selection->data + selection->length - 1; p >= selection->data; ) {
-                if (strncmp(p, right, strlen(right)) == 0) {
+        case LEFT_BRACKET:
+            for (char* p = selection->data + selection->length - 1; p >= selection->data; p--) {
+                if (strncmp(p, right, strlen(right)) == 0)
                     nesting++;
-                    p -= strlen(right);
-                } else if (strncmp(p, left, strlen(left)) == 0) {
+                else if (strncmp(p, left, strlen(left)) == 0) {
                     if ( ! nesting) {
                         position = p;
                         break;
                     }
                     nesting--;
-                    p -= strlen(left);
-                } else
-                    p--;
+                }
             }
             break;
 
