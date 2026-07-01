@@ -301,10 +301,8 @@ char* find_above_or_below(
             send_key(window, selecting <= UP ? XK_Up : XK_Down, ShiftMask);
 
         peek_selection(window, selection);
-        if (data_equal(*selection, old_selection)) { // end of file
-            puts("End of file.");
+        if (data_equal(*selection, old_selection)) // end of file
             return NULL;
-        }
 
         // NOTE: Quotes cannot be sensibly matched without analyzing language
         // semantics of the whole file. Therefore, we'll just assume that we are
@@ -360,16 +358,13 @@ char* find_above_or_below(
             fail("Unreachable. Line %i.\n", __LINE__);
         }
 
-        if (position != NULL) {
-            printf("Found character '%s'\n", utf8_character);
+        if (position != NULL)
             return position;
-        }
 
         char keymap[32];
         XQueryKeymap(g_display, keymap);
-        if (key_down(keymap, XK_Escape)) {
+        if (key_down(keymap, XK_Escape)) { // user cancels search
             send_key(window, selecting <= UP ? XK_Right : XK_Left, 0);
-            puts("Aborting search.");
             return NULL;
         }
         // Keyboard not grabbed, so the only sensible thing to do if any key
@@ -644,10 +639,6 @@ int main(void)
         }
         XUngrabKeyboard(g_display, CurrentTime);
         XFlush(g_display);
-
-        printf("Finding key '%s' from string %s\n",
-                utf8_character,
-                selection.data);
 
         char* position = strstr(selection.data, utf8_character);
         if (selecting <= LEFT) // find last
