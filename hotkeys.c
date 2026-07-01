@@ -222,7 +222,6 @@ Data peek_selection(Window window, Data* optional_buf)
     send_key(window, XK_c, ControlMask);
     XFlush(g_display);
     usleep(10*1000); // wait for copy to happen
-    usleep(1000*1000); // TODO TEMP
 
     Data clipboard = get_clipboard(optional_buf);
     set_clipboard(clipboard_backup);
@@ -410,7 +409,6 @@ int main(void)
     // reliable way of forwarding them to applications (Kate specifically)
     // without breaking key repeat. We use key_down() instead for arrow keys.
     KeySym keys_to_grab[] = {
-        XK_Escape, // TODO temp exit while developing.
         XK_f, XK_t, // find character on left, right, above, and below
         XK_section, XK_aring, // '§' and 'å' as custom modifiers
         XK_i, XK_a, // inner and outer (all)
@@ -435,12 +433,6 @@ int main(void)
         goto main_event_loop;
 
     KeySym key = XKeycodeToKeysym(g_display, event.xkey.keycode, 0);
-    if (key == XK_Escape) // TODO temporary convenience while developing
-        exit(EXIT_SUCCESS);
-    printf("Key %s: Keycode=%i, Keysym=%s\n", // TODO temp logging.
-        event.type == KeyPress ? "pressed" : "released",
-        event.xkey.keycode,
-        XKeysymToString(key));
 
     XFREE char* focused_instance;
     Window focused;
@@ -685,16 +677,16 @@ int main(void)
             for (char* p = selection.data;
                 p < position + inclusive;
                 p += char_size(p)
-            ) // TODO sleep and flush
-                usleep(10*1000), send_key(focused, XK_Right, ShiftMask), XFlush(g_display);
+            )
+                send_key(focused, XK_Right, ShiftMask);
             break;
 
         case LEFT: case UP: case LEFT_BRACKET:
             for (char* p = selection.data + selection.length;
                 p - 1 > position - inclusive;
                 p -= char_size_back(p)
-            ) // TODO sleep and flush
-                usleep(10*100), send_key(focused, XK_Left, ShiftMask), XFlush(g_display);
+            )
+                send_key(focused, XK_Left, ShiftMask);
             break;
 
         case NONE:
@@ -702,9 +694,6 @@ int main(void)
         }
 
         if (abs(selecting) == BRACKET) { // find matching
-            puts("Going back.");
-            usleep(3000*1000); // TODO
-
             // Send key to go to the opposite bracket found.
             // Edge case: If starting non-inclusive search right before the bracket
             // to search, then the first selection will end up empty, so we don't
